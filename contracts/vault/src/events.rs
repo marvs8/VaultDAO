@@ -184,6 +184,23 @@ pub fn emit_proposal_rejected(env: &Env, proposal_id: u64, rejector: &Address, p
     );
 }
 
+/// Emit when a signer explicitly rejects a proposal via `reject_proposal` (Issue #1522).
+///
+/// Published under the same `proposal_rejected` topic as `emit_proposal_rejected` since
+/// that is the on-chain event name integrators watch, but carries the vault-wide
+/// cumulative rejection count instead of the proposer.
+pub fn emit_proposal_explicit_rejection(
+    env: &Env,
+    proposal_id: u64,
+    rejector: &Address,
+    total_rejection_count: u64,
+) {
+    env.events().publish(
+        (Symbol::new(env, "proposal_rejected"), proposal_id),
+        (rejector.clone(), total_rejection_count),
+    );
+}
+
 /// Emit when a proposal is cancelled with a refund
 pub fn emit_proposal_cancelled(
     env: &Env,
@@ -2013,5 +2030,35 @@ pub fn emit_proposal_auto_cancelled_limit_exceeded(
             proposal_id,
         ),
         (reason, admin.clone()),
+    );
+}
+
+/// Emit when a signer's rolling participation rate has stayed below
+/// `Config.min_participation_rate` for `Config.low_participation_consecutive_proposals`
+/// proposals in a row (Issue #1093).
+pub fn emit_low_participation_alert(
+    env: &Env,
+    signer: &Address,
+    participation_rate: u32,
+    threshold: u32,
+    consecutive_low_periods: u32,
+) {
+    env.events().publish(
+        (Symbol::new(env, "low_participation_alert"), signer.clone()),
+        (participation_rate, threshold, consecutive_low_periods),
+    );
+}
+
+/// Emit when an underperforming signer is force-rotated out via a completed
+/// force-rotation governance vote (Issue #1093).
+pub fn emit_signer_force_rotated(
+    env: &Env,
+    target: &Address,
+    replacement: &Address,
+    request_id: u64,
+) {
+    env.events().publish(
+        (Symbol::new(env, "signer_force_rotated"), request_id),
+        (target.clone(), replacement.clone()),
     );
 }

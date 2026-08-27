@@ -40,17 +40,18 @@ use types::{
     ConditionLogic, Config, ConfigParam, CrossChainAsset, CrossChainProposal, CrossVaultConfig,
     CrossVaultProposal, CrossVaultStatus, DeadLetterRecord, Delegation, DelegationHistory,
     DexConfig, Dispute, DisputeResolution, DisputeStatus, Escrow, EscrowStatus,
-    ExecutionFeeEstimate, FundingMilestone, FundingMilestoneStatus, FundingRound,
-    FundingRoundConfig, FundingRoundStatus, GasConfig, GasPriceOracleConfig, GasPriceSource,
-    GovernanceProposal, HolidayBehavior, HolidayCalendar, HookEventType, HookRegistration,
-    ImpactScore, InitConfig, InsuranceClaim, InsuranceClaimStatus, InsuranceConfig, ListMode,
-    Milestone, MultiPhaseProposal, NotificationPreferences, NotificationPrefs,
-    OptionalProposalOperation, OptionalVaultOracleConfig, PauseCooldownConfig, PauseState,
-    Priority, Proposal, ProposalAmendment, ProposalOperation, ProposalPhase, ProposalPhaseStatus,
-    ProposalStatus, ProposalTemplate, RecoveryConfig, RecoveryProposal, RecoveryStatus,
-    RecurringPayment, RecurringStatus, Reputation, ReputationConfig, RetryConfig, RetryState, Role,
-    RoleAssignment, ScheduledTransferConfig, ScopedDelegation, SignerTier, StakingConfig,
-    StreamRateWindow, StreamStatus, StreamingPayment, Subscription, SubscriptionStatus,
+    ExecutionFeeEstimate, ForceRotationRequest, FundingMilestone, FundingMilestoneStatus,
+    FundingRound, FundingRoundConfig, FundingRoundStatus, GasConfig, GasPriceOracleConfig,
+    GasPriceSource, GovernanceProposal, HolidayBehavior, HolidayCalendar, HookEventType,
+    HookRegistration, ImpactScore, InitConfig, InsuranceClaim, InsuranceClaimStatus,
+    InsuranceConfig, ListMode, Milestone, MultiPhaseProposal, NotificationPreferences,
+    NotificationPrefs, OptionalProposalOperation, OptionalVaultOracleConfig, PauseCooldownConfig,
+    PauseState, Priority, Proposal, ProposalAmendment, ProposalOperation, ProposalPhase,
+    ProposalPhaseStatus, ProposalStatus, ProposalTemplate, RecoveryConfig, RecoveryProposal,
+    RecoveryStatus, RecurringPayment, RecurringStatus, Reputation, ReputationConfig, RetryConfig,
+    RetryState, Role, RoleAssignment, ScheduledTransferConfig, ScopedDelegation,
+    SignerParticipationScore, SignerTier, StakingConfig, StreamRateWindow, StreamStatus,
+    StreamingPayment, Subscription, SubscriptionStatus,
     SubscriptionTier, SwapProposal, SwapResult, TemplateFeeTier, TemplateOverrides,
     ThresholdStrategy, TokenSpendingConfig, TransferDetails, VaultAction, VaultMetrics,
     VaultOracleConfig, VaultPriceData, VaultTemplate, VelocityConfig, VestingSchedule, VoteChoice,
@@ -455,6 +456,10 @@ mod test_subscriptions;
 #[cfg(test)]
 mod test_supersession_chain;
 #[cfg(test)]
+mod test_signers_with_roles;
+#[cfg(test)]
+mod test_participation_scoring;
+#[cfg(test)]
 mod test_tag_taxonomy;
 #[cfg(test)]
 mod test_tags;
@@ -603,6 +608,12 @@ impl VaultDAO {
             return Err(VaultError::InvalidProposalIdPrefix);
         }
 
+        // Issue #1527: veto_addresses set but veto_window_ledgers == 0 would silently
+        // disable veto while leaving addresses populated — reject this combination.
+        if !config.veto_addresses.is_empty() && config.veto_window_ledgers == 0 {
+            return Err(VaultError::InvalidVetoConfig);
+        }
+
         // Admin must authorize initialization
         admin.require_auth();
 
@@ -652,6 +663,10 @@ impl VaultDAO {
             arbitration_timeout_ledgers: 17_280 * 30, // 30 days
             approval_timeout_ledgers: 0,
             exec_window_ledgers: 0, // Set via set_exec_window_ledgers post-init (Issue #1349)
+            // Participation scoring defaults; tune via update_participation_config (Issue #1093).
+            min_participation_rate: 50,
+            low_participation_streak_n: 3,
+            participation_rate_window: 20,
         };
 
         // Apply staking config from InitConfig
@@ -1773,6 +1788,19 @@ impl VaultDAO {
             // Reputation boost for approving
             Self::update_reputation_on_approval(&env, &voter);
 
+            // Signer participation scoring (Issue #1093)
+            let (rate, should_alert) = storage::record_participation_vote(&env, &voter, &config);
+            if should_alert {
+                let score = storage::get_participation_score(&env, &voter);
+                events::emit_low_participation_alert(
+                    &env,
+                    &voter,
+                    rate,
+                    config.min_participation_rate,
+                    score.consecutive_low_periods,
+                );
+            }
+
             // Emit delegated vote event if voting through delegation
             if voter != signer {
                 events::emit_delegated_vote(&env, proposal_id, &voter, &signer);
@@ -1920,6 +1948,20 @@ impl VaultDAO {
             // Track participation for abstaining
             Self::update_reputation_on_abstention(&env, &voter);
 
+            // Signer participation scoring (Issue #1093): an explicit
+            // abstention still counts as engagement, not a miss.
+            let (rate, should_alert) = storage::record_participation_vote(&env, &voter, &config);
+            if should_alert {
+                let score = storage::get_participation_score(&env, &voter);
+                events::emit_low_participation_alert(
+                    &env,
+                    &voter,
+                    rate,
+                    config.min_participation_rate,
+                    score.consecutive_low_periods,
+                );
+            }
+
             // Emit delegated vote event if voting through delegation
             if voter != signer {
                 events::emit_delegated_vote(&env, proposal_id, &voter, &signer);
@@ -1998,6 +2040,50 @@ impl VaultDAO {
             &signer,
             proposal.abstentions.len(),
             proposal.approvals.len() + proposal.abstentions.len(),
+        );
+
+        Ok(())
+    }
+
+    /// Explicitly reject a pending proposal.
+    ///
+    /// Any current signer may call this to immediately reject a `Pending` proposal
+    /// (Issue #1522). This mirrors the rejection semantics used when an Admin cancels
+    /// another proposer's proposal via `cancel_proposal`: the reserved spending limits
+    /// are NOT refunded, insurance/stake slashing on rejection is applied, and an audit
+    /// entry plus a `proposal_rejected` event are recorded.
+    ///
+    /// # Arguments
+    /// * `signer` - Address of the signer rejecting the proposal (must authorize).
+    /// * `proposal_id` - ID of the proposal to reject.
+    pub fn reject_proposal(env: Env, signer: Address, proposal_id: u64) -> Result<(), VaultError> {
+        signer.require_auth();
+
+        let config = storage::get_config(&env)?;
+        if !config.signers.contains(&signer) {
+            return Err(VaultError::NotASigner);
+        }
+
+        let mut proposal = storage::get_proposal(&env, proposal_id)?;
+        if proposal.status != ProposalStatus::Pending {
+            return Err(VaultError::ProposalNotPending);
+        }
+
+        proposal.status = ProposalStatus::Rejected;
+        storage::set_proposal(&env, &proposal);
+
+        storage::metrics_on_rejection(&env);
+        Self::slash_insurance_on_rejection(&env, &proposal);
+        Self::slash_stake_on_rejection(&env, &proposal);
+
+        storage::create_audit_entry(&env, AuditAction::RejectProposal, &signer, proposal_id);
+
+        let metrics = storage::get_metrics(&env);
+        events::emit_proposal_explicit_rejection(
+            &env,
+            proposal_id,
+            &signer,
+            metrics.rejected_count,
         );
 
         Ok(())
@@ -4096,6 +4182,9 @@ impl VaultDAO {
                 arbitration_timeout_ledgers: 17_280 * 30,
                 approval_timeout_ledgers: 0,
                 exec_window_ledgers: 0,
+                min_participation_rate: 50,
+                low_participation_streak_n: 3,
+                participation_rate_window: 20,
             }
         });
         (config.quorum, config.quorum_percentage)
@@ -4882,6 +4971,29 @@ impl VaultDAO {
 
                             // Emit expiry event
                             events::emit_proposal_expired(&env, proposal_id, current_ledger);
+
+                            // Signer participation scoring (Issue #1093): every
+                            // eligible signer who neither approved nor abstained missed this vote.
+                            for eligible in proposal.snapshot_signers.iter() {
+                                if proposal.approvals.contains(&eligible)
+                                    || proposal.abstentions.contains(&eligible)
+                                {
+                                    continue;
+                                }
+                                let (rate, should_alert) =
+                                    storage::record_participation_miss(&env, &eligible, &config);
+                                if should_alert {
+                                    let score =
+                                        storage::get_participation_score(&env, &eligible);
+                                    events::emit_low_participation_alert(
+                                        &env,
+                                        &eligible,
+                                        rate,
+                                        config.min_participation_rate,
+                                        score.consecutive_low_periods,
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -5057,6 +5169,196 @@ impl VaultDAO {
         storage::extend_instance_ttl(&env);
         let config = storage::get_config(&env)?;
         Ok(config.signers)
+    }
+
+    /// Return every current signer paired with its role in a single call,
+    /// avoiding N+1 `get_role` reads for callers that need both (Issue #1637).
+    ///
+    /// Reflects the live `Config.signers` list, so removed signers never
+    /// appear even if a stale `RoleAssignment` record still exists for them.
+    pub fn get_signers_with_roles(env: Env) -> Result<Vec<(Address, Role)>, VaultError> {
+        storage::extend_instance_ttl(&env);
+        let config = storage::get_config(&env)?;
+        let mut result = Vec::new(&env);
+        for signer in config.signers.iter() {
+            let role = storage::get_role(&env, &signer);
+            result.push_back((signer, role));
+        }
+        Ok(result)
+    }
+
+    // ========================================================================
+    // Issue #1093: Signer Participation Scoring
+    // ========================================================================
+
+    /// Return `signer`'s raw participation record. Advisory only.
+    pub fn get_participation_score(env: Env, signer: Address) -> SignerParticipationScore {
+        storage::get_participation_score(&env, &signer)
+    }
+
+    /// Percentage (0-100) of the most recent `window` proposals (capped at
+    /// the 100-proposal history buffer) that `signer` voted on (approved or
+    /// abstained). Returns 0 if the signer has no recorded history yet.
+    pub fn get_participation_rate(
+        env: Env,
+        signer: Address,
+        window: u32,
+    ) -> Result<u32, VaultError> {
+        if window == 0 || window > storage::PARTICIPATION_HISTORY_CAP {
+            return Err(VaultError::InvalidParticipationWindow);
+        }
+        let score = storage::get_participation_score(&env, &signer);
+        Ok(storage::compute_participation_rate(&score, window))
+    }
+
+    /// Update the participation-scoring thresholds. Admin only.
+    pub fn update_participation_config(
+        env: Env,
+        admin: Address,
+        min_participation_rate: u32,
+        low_participation_streak_n: u32,
+        participation_rate_window: u32,
+    ) -> Result<(), VaultError> {
+        admin.require_auth();
+        storage::extend_instance_ttl(&env);
+
+        let role = storage::get_role(&env, &admin);
+        if !Role::role_satisfies(Role::Admin, role) {
+            return Err(VaultError::InsufficientRole);
+        }
+        if participation_rate_window == 0
+            || participation_rate_window > storage::PARTICIPATION_HISTORY_CAP
+        {
+            return Err(VaultError::InvalidParticipationWindow);
+        }
+
+        let mut config = storage::get_config(&env)?;
+        config.min_participation_rate = min_participation_rate;
+        config.low_participation_streak_n = low_participation_streak_n;
+        config.participation_rate_window = participation_rate_window;
+        storage::set_config(&env, &config);
+
+        events::emit_config_updated(&env, &admin);
+
+        Ok(())
+    }
+
+    /// Propose force-rotating an underperforming signer out of the vault.
+    /// Admin only. `target` must currently be in a sustained low-participation
+    /// streak of at least 30 days. Auto-executes if `Config.threshold` is 1
+    /// (the admin's own approval already satisfies it).
+    pub fn propose_force_rotation(
+        env: Env,
+        admin: Address,
+        target: Address,
+        replacement: Address,
+    ) -> Result<u64, VaultError> {
+        admin.require_auth();
+        storage::extend_instance_ttl(&env);
+
+        let role = storage::get_role(&env, &admin);
+        if !Role::role_satisfies(Role::Admin, role) {
+            return Err(VaultError::InsufficientRole);
+        }
+
+        let config = storage::get_config(&env)?;
+        if !config.signers.contains(&target) {
+            return Err(VaultError::SignerNotFound);
+        }
+        if config.signers.contains(&replacement) {
+            return Err(VaultError::ForceRotationReplacementAlreadySigner);
+        }
+
+        const THIRTY_DAYS_LEDGERS: u32 = storage::DAY_IN_LEDGERS * 30;
+        let score = storage::get_participation_score(&env, &target);
+        let since = score
+            .low_participation_since_ledger
+            .ok_or(VaultError::SignerNotEligibleForForceRotation)?;
+        let current_ledger = env.ledger().sequence();
+        if current_ledger.saturating_sub(since) < THIRTY_DAYS_LEDGERS {
+            return Err(VaultError::SignerNotEligibleForForceRotation);
+        }
+
+        let id = storage::next_force_rotation_id(&env);
+        let mut approvals = Vec::new(&env);
+        approvals.push_back(admin.clone());
+        let request = ForceRotationRequest {
+            id,
+            target,
+            replacement,
+            approvals,
+            created_at: current_ledger,
+            executed: false,
+        };
+        storage::set_force_rotation_request(&env, &request);
+
+        if request.approvals.len() >= config.threshold {
+            Self::execute_force_rotation(&env, &admin, id)?;
+        }
+
+        Ok(id)
+    }
+
+    /// Add a signer approval to a pending force-rotation request, executing
+    /// it once `Config.threshold` distinct approvals are reached.
+    pub fn approve_force_rotation(
+        env: Env,
+        signer: Address,
+        request_id: u64,
+    ) -> Result<(), VaultError> {
+        signer.require_auth();
+
+        let config = storage::get_config(&env)?;
+        if !config.signers.contains(&signer) {
+            return Err(VaultError::NotASigner);
+        }
+
+        let mut request = storage::get_force_rotation_request(&env, request_id)?;
+        if request.executed {
+            return Err(VaultError::ForceRotationAlreadyExecuted);
+        }
+        if request.approvals.contains(&signer) {
+            return Err(VaultError::ForceRotationAlreadyApprovedBySigner);
+        }
+
+        request.approvals.push_back(signer.clone());
+        storage::set_force_rotation_request(&env, &request);
+
+        if request.approvals.len() >= config.threshold {
+            Self::execute_force_rotation(&env, &signer, request_id)?;
+        }
+
+        Ok(())
+    }
+
+    fn execute_force_rotation(env: &Env, actor: &Address, request_id: u64) -> Result<(), VaultError> {
+        let mut request = storage::get_force_rotation_request(env, request_id)?;
+        if request.executed {
+            return Err(VaultError::ForceRotationAlreadyExecuted);
+        }
+
+        let mut config = storage::get_config(env)?;
+        let mut found_idx: Option<u32> = None;
+        for i in 0..config.signers.len() {
+            if config.signers.get(i).unwrap() == request.target {
+                found_idx = Some(i);
+                break;
+            }
+        }
+        let idx = found_idx.ok_or(VaultError::SignerNotFound)?;
+
+        let old_role = storage::get_role(env, &request.target);
+        config.signers.set(idx, request.replacement.clone());
+        storage::set_config(env, &config);
+        storage::set_role(env, &request.replacement, old_role);
+
+        request.executed = true;
+        storage::set_force_rotation_request(env, &request);
+
+        storage::create_audit_entry(env, AuditAction::RemoveSigner, actor, request_id);
+        events::emit_signer_force_rotated(env, &request.target, &request.replacement, request_id);
+
+        Ok(())
     }
 
     /// Propose a configuration change that requires multi-sig approval.
@@ -9137,7 +9439,7 @@ impl VaultDAO {
             signer_snapshot: storage::build_signer_snapshot(&env, &config.signers),
             fee_estimate_cache: None,
             fee_cache_timestamp: 0,
-            spend_day: storage::get_day_number(&env),
+a            spend_day: storage::get_day_number(&env),
             spend_week: storage::get_week_number(&env),
             has_spend_buckets: true,
             approved_at: 0,
